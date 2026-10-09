@@ -28,7 +28,15 @@ pub use response::Prediction;
 pub use script::translation_target;
 pub use surrounding_text::SurroundingText;
 
-use super::*;
+use super::{
+    Engine, MIN_PREDICTION_LETTERS, PREDICTION_CANDIDATE_HINTS, is_raw, query,
+    segment_longest_prefix, take_first_chars, take_last_chars,
+};
+use crate::candidate::Candidate;
+use crate::engine::commit::LastCommit;
+use crate::engine::input_log::{InputLogEntry, InputLogger, InputSource};
+use crate::parser::{self, Segmentation};
+use crate::{sentence, shortcut};
 
 impl Engine {
     /// 是否接了会联想的 Predictor；壳据此决定要不要起轮询定时器、画云朵标识。
@@ -57,6 +65,7 @@ impl Engine {
         self.prediction_sequence += 1;
         // 辅码态在按码筛词，云端词没有码、进来只会打乱；不发请求，槽位自然收起
         if self.aux_filter().is_some() {
+            self.predictor.cancel();
             return None;
         }
         let policy = self.predictor.policy();
@@ -72,6 +81,7 @@ impl Engine {
             || self.modes().is_expression(scope, self.zhuyin)
             || is_raw(scope, self.modes(), self.shuangpin, self.zhuyin)
         {
+            self.predictor.cancel();
             return None;
         }
         // 问字模式：问题本身就是全部上下文，不带应用文本、不要整句、本地没有候选可提示
@@ -80,6 +90,7 @@ impl Engine {
             && shortcut::unicode_form(self.modes().question_body(scope, self.zhuyin)).is_some()
         {
             // 码点输入本地就能答，不问云端
+            self.predictor.cancel();
             return None;
         }
         let (kind, pinyin_source, before, after) = if question {
@@ -97,6 +108,7 @@ impl Engine {
         let pinyin_source: &str = decoded.as_ref().map_or(pinyin_source, |d| d.pinyin());
         let letters = pinyin_source.chars().filter(|c| *c != '\'').count();
         if letters < MIN_PREDICTION_LETTERS {
+            self.predictor.cancel();
             return None;
         }
         let (pinyin, syllables, guess, abbreviated) = match segment_longest_prefix(pinyin_source) {
@@ -179,6 +191,7 @@ impl Engine {
     /// 作废正在飞的联想（用户清空了拼音、关掉了联想框）。
     pub fn cancel_prediction(&mut self) {
         self.prediction_sequence += 1;
+        self.predictor.cancel();
     }
 
     /// 取回最近一次请求的结果；过期结果直接丢。没有就绪的结果返回 `None`，不阻塞。

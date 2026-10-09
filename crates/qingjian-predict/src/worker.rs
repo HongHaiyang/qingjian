@@ -3,20 +3,25 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use qingjian_core::{Prediction, PredictionRequest};
+use qingjian_core::Prediction;
+use tokio::sync::watch;
 
 use crate::prompt::Reply;
 
 use crate::cache::PredictionCache;
 use crate::chat_client::ChatClient;
 use crate::error::PredictError;
+use crate::pending::PendingRequest;
 
 /// 缓存条数。
 const CACHE_CAPACITY: usize = 64;
 
 pub struct Worker {
     /// 请求入口。主线程 drop 掉发送端后线程自然退出。
-    requests: Receiver<PredictionRequest>,
+    requests: Receiver<PendingRequest>,
+
+    /// 取消代次；发送端关闭也会停止正在等待的 HTTP。
+    cancellations: watch::Receiver<u64>,
 
     /// 结果出口。
     responses: Sender<Prediction>,
@@ -36,13 +41,15 @@ type Cached = Reply;
 
 impl Worker {
     pub fn new(
-        requests: Receiver<PredictionRequest>,
+        requests: Receiver<PendingRequest>,
         responses: Sender<Prediction>,
         client: ChatClient,
         debounce: Duration,
+        cancellations: watch::Receiver<u64>,
     ) -> Self {
         Self {
             requests,
+            cancellations,
             responses,
             client,
             debounce,
@@ -56,9 +63,16 @@ impl Worker {
             .enable_all()
             .build()?;
         while let Ok(first) = self.requests.recv() {
-            let Some(request) = self.debounce(first) else {
+            let Some(pending) = self.debounce(first) else {
                 return Ok(());
             };
+            if self.cancellations.has_changed().is_err() {
+                return Ok(());
+            }
+            if pending.generation != *self.cancellations.borrow_and_update() {
+                continue;
+            }
+            let request = pending.request;
             let key = PredictionCache::key(&request);
             if let Some(reply) = self.cache.get(&key) {
                 tracing::debug!(sequence = request.sequence, kind = ?request.kind, "联想命中缓存");
@@ -66,7 +80,18 @@ impl Worker {
                 continue;
             }
             let start = Instant::now();
-            match runtime.block_on(self.client.complete(&request)) {
+            let result = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = self.cancellations.changed() => None,
+                    result = self.client.complete(&request) => Some(result),
+                }
+            });
+            if pending.generation != *self.cancellations.borrow() || result.is_none() {
+                tracing::debug!(sequence = request.sequence, "联想已取消");
+                continue;
+            }
+            match result.expect("取消已处理") {
                 Ok(reply) => {
                     tracing::info!(
                         sequence = request.sequence,
@@ -91,7 +116,7 @@ impl Worker {
     }
 
     /// 防抖：在窗口内持续收到新请求就一直等，只保留最后一个。发送端关闭返回 `None`。
-    fn debounce(&self, mut latest: PredictionRequest) -> Option<PredictionRequest> {
+    fn debounce(&self, mut latest: PendingRequest) -> Option<PendingRequest> {
         loop {
             match self.requests.recv_timeout(self.debounce) {
                 Ok(newer) => latest = newer,

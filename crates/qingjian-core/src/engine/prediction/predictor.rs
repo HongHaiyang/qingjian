@@ -13,6 +13,9 @@ pub trait Predictor: Send {
     /// 提交请求，不能阻塞。
     fn submit(&mut self, request: PredictionRequest);
 
+    /// 作废待发与在途的请求，不能阻塞。默认不处理，Engine 仍会丢弃过期结果。
+    fn cancel(&mut self) {}
+
     /// 取一条已到达的结果，没有就返回 `None`，不能阻塞。
     fn poll(&mut self) -> Option<Prediction>;
 

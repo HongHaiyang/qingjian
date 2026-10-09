@@ -1,11 +1,15 @@
+//! 云联想入口：提交、取消与轮询都不阻塞输入线程。
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use qingjian_core::{Prediction, PredictionPolicy, PredictionRequest, Predictor};
+use tokio::sync::watch;
 
 use crate::chat_client::ChatClient;
 use crate::config::PredictConfig;
 use crate::error::PredictError;
+use crate::pending::PendingRequest;
 use crate::worker::Worker;
 
 /// 走网络的联想器。构造时起一个后台线程，`submit` / `poll` 都只碰通道，不阻塞。
@@ -14,7 +18,10 @@ pub struct CloudPredictor {
     policy: PredictionPolicy,
 
     /// 往后台线程发请求。
-    requests: Sender<PredictionRequest>,
+    requests: Sender<PendingRequest>,
+
+    /// 取消通知独立于请求队列，在等待 HTTP 时也能唤醒后台线程。
+    cancellations: watch::Sender<u64>,
 
     /// 从后台线程收结果。
     responses: Receiver<Prediction>,
@@ -29,11 +36,13 @@ impl CloudPredictor {
         let client = ChatClient::new(config, api_key);
         let (requests, request_rx) = mpsc::channel();
         let (response_tx, responses) = mpsc::channel();
+        let (cancellations, cancellation_rx) = watch::channel(0);
         let worker = Worker::new(
             request_rx,
             response_tx,
             client,
             Duration::from_millis(config.debounce_ms),
+            cancellation_rx,
         );
         std::thread::Builder::new()
             .name("qingjian-predict".to_owned())
@@ -52,6 +61,7 @@ impl CloudPredictor {
         Ok(Self {
             policy: config.policy(),
             requests,
+            cancellations,
             responses,
         })
     }
@@ -63,9 +73,18 @@ impl Predictor for CloudPredictor {
     }
 
     fn submit(&mut self, request: PredictionRequest) {
-        if self.requests.send(request).is_err() {
+        let pending = PendingRequest {
+            request,
+            generation: *self.cancellations.borrow(),
+        };
+        if self.requests.send(pending).is_err() {
             tracing::warn!("联想线程已退出，请求被丢弃");
         }
+    }
+
+    fn cancel(&mut self) {
+        self.cancellations
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     fn poll(&mut self) -> Option<Prediction> {
